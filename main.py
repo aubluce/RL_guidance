@@ -53,8 +53,9 @@ predictor = BertClassificationPredictor(
 
 prob_threshold = 3.3
 old_action = None
+policy_type = 'BERT'
 env = Environment(processed_combined, processed_test, prob_threshold, predictor, w2v_model,
-                  glove_model, key_phrase_list, key_phrase_list, old_action, bert_tokenizer)
+                  glove_model, key_phrase_list, key_phrase_list, old_action, bert_tokenizer, policy_type)
 # num_classes is 119 if individual words. 40 if phrases.
 agent = Agent(embed_dim=11, seed=sys.argv[2], num_classes=40)
 
@@ -74,7 +75,7 @@ render = True  # If we should render during rollout
 render_every = 10  # Only render every n iterations
 save_freq = 1000  # How often we save in number of iterations
 seed = 15
-policy_type = 'BERT'
+
 
 ppo = PPO(env, agent, updates_per_iteration, max_timesteps_per_episode, total_timesteps, timesteps_per_batch, lr, gamma, clip, render,
                     render_every, save_freq, seed, policy_type)
