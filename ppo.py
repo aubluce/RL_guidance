@@ -3,7 +3,6 @@ import pandas as pd
 import time
 import torch
 import torch.nn as nn
-from torch.optim import Adam
 from torch.distributions import Categorical
 from utils import plot_rewards
 
@@ -67,7 +66,7 @@ class PPO():
             'actor_losses': [],  # losses of actor network in current iteration
         }
 
-    def get_action(self, obs):
+    def get_action(self, obs, attention_mask):
         """
             Queries an action from the actor network, should be called from rollout.
             Parameters:
@@ -77,11 +76,15 @@ class PPO():
                 log_prob - the log probability of the selected action in the distribution
         """
         # Query the actor network for a mean action
-        import pdb
-        pdb.set_trace()
+
         obs = torch.from_numpy(obs)
         obs = obs.to(device)
-        logits = self.actor.float()(obs)
+        attention_mask = torch.from_numpy(attention_mask)
+        attention_mask = attention_mask.to(device)
+        if self.policy_type == 'BERT':
+            logits = self.actor.float()(obs, attention_mask)
+        else:
+            logits = self.actor.float()(obs)
         probs = Categorical(logits=logits)
         action = probs.sample()
         # Calculate the log probability for that action
@@ -89,7 +92,7 @@ class PPO():
         # Return the sampled action and the log probability of that action in our distribution
         return action.detach(), log_prob.detach()
 
-    def evaluate(self, batch_obs, batch_acts):
+    def evaluate(self, batch_obs, batch_acts, batch_attention_masks):
         """
             Estimate the values of each observation, and the log probs of
             each action in the most recent batch with the most recent
@@ -104,10 +107,13 @@ class PPO():
                 log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
         """
         # Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
-        V = self.critic(batch_obs).squeeze()
+        if self.policy_type == 'BERT':
+            V = self.critic(batch_obs, batch_attention_masks)
+            action_probs = self.actor.float()(batch_obs.to(device), batch_attention_masks.to(device))
+        else:
+            V = self.critic(batch_obs).squeeze()
+            action_probs = self.actor.float()(batch_obs.to(device))
 
-        # Calculate the log probabilities of batch actions using most recent actor network.
-        action_probs = self.actor.float()(batch_obs.to(device))
         dist = Categorical(logits=action_probs)
         # Calculate the log probability for that action
         log_probs = dist.log_prob(batch_acts.to(device))
@@ -139,23 +145,25 @@ class PPO():
         batch_lens = []
         batch_scores = []
         batch_ep_acts = []
+        batch_attention_masks = []
 
         t = 0  # timesteps we've run so far this batch
         # Keep simulating until we've run more than or equal to specified timesteps per batch
         while t < self.timesteps_per_batch:
-            ep_rews = []  # rewards collected per episode
-            ep_resp = []  # responses collected per episode
-            ep_acts = []  # actions chosen per episode
             # Reset the environment. sNote that obs is short for observation. - STATE
-            obs, _ = self.env.reset()
+            obs, original_response, attention_mask = self.env.reset()
+            ep_rews = []  # rewards collected per episode
+            ep_resp = [original_response]  # responses collected per episode
+            ep_acts = []  # actions chosen per episode
 
             # Run an episode for a maximum of max_timesteps_per_episode timesteps
             for ep_t in range(self.max_timesteps_per_episode):
                 t += 1  # Increment timesteps ran this batch so far
                 batch_obs.append(obs)  # Track observations in this batch
+                batch_attention_masks.append(attention_mask) # when using BERT as policy
 
                 # Calculate action and make a step in the env.
-                action, log_prob = self.get_action(obs)
+                action, log_prob = self.get_action(obs, attention_mask)
                 obs, rew, done, response = self.env.step(action.item(), None)
 
                 # Track recent reward, action, and action log probability
@@ -177,6 +185,7 @@ class PPO():
 
         # Reshape data as tensors in the shape specified in function description, before returning
         batch_obs = torch.tensor(np.array(batch_obs), dtype=torch.float)
+        batch_attention_masks = torch.tensor(np.array(batch_attention_masks), dtype=torch.float)
         batch_acts = torch.tensor(batch_acts, dtype=torch.float)
         batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
         batch_rtgs = self.compute_rtgs(batch_rews)
@@ -185,7 +194,8 @@ class PPO():
         self.logger['batch_rews'] = batch_rews
         self.logger['batch_lens'] = batch_lens
 
-        return batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens, batch_resp, batch_scores, batch_ep_acts
+        return batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens, batch_resp, \
+               batch_scores, batch_ep_acts, batch_attention_masks
 
     def compute_rtgs(self, batch_rews):
         """
@@ -272,7 +282,7 @@ class PPO():
         while t_so_far < self.total_timesteps:
             # we're collecting our batch simulations here
             batch_obs, batch_acts, batch_log_probs, batch_rtgs, \
-                        batch_lens, batch_resp, batch_scores, batch_ep_acts = self.rollout()
+                        batch_lens, batch_resp, batch_scores, batch_ep_acts, batch_attention_masks = self.rollout()
 
             scores_list.append(batch_scores)
             actions_list.append(batch_ep_acts)
@@ -287,7 +297,7 @@ class PPO():
             self.logger['t_so_far'] = t_so_far
             self.logger['i_so_far'] = i_so_far
 
-            V, old_log_probs, old_dist_entropy = self.evaluate(batch_obs, batch_acts)  # Calculate advantage at k-th iteration
+            V, old_log_probs, old_dist_entropy = self.evaluate(batch_obs, batch_acts, batch_attention_masks)  # Calculate advantage at k-th iteration
             A_k = batch_rtgs - V.detach()
 
             A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)  # Normalizing advantages
@@ -295,7 +305,7 @@ class PPO():
             # update our network for some n epochs
             for _ in range(self.updates_per_iteration):
 
-                V, curr_log_probs, dist_entropy = self.evaluate(batch_obs, batch_acts)  # Calculate V_phi and pi_theta(a_t | s_t)
+                V, curr_log_probs, dist_entropy = self.evaluate(batch_obs, batch_acts, batch_attention_masks)  # Calculate V_phi and pi_theta(a_t | s_t)
                 ratios = torch.exp(curr_log_probs - batch_log_probs.to(device))  # Calculate the ratio pi_theta(a_t | s_t) / pi_theta_k(a_t | s_t)
 
                 A_k = A_k.to(device)
